@@ -762,4 +762,650 @@
         }
       }
 
-      // Prefer Opus/WebM, then MP
+      // Prefer Opus/WebM, then MPand finally the browser's default format.
+      function createMediaRecorder(stream) {
+        for (const mimeType of preferredMimeTypes) {
+          try {
+            if (
+              typeof MediaRecorder.isTypeSupported === "function" &&
+              !MediaRecorder.isTypeSupported(mimeType)
+            ) {
+              continue;
+            }
+
+            return new MediaRecorder(stream, { mimeType });
+          } catch (_) {
+            // Try the next supported format.
+          }
+        }
+
+        // Let the browser select its default recording format.
+        return new MediaRecorder(stream);
+      }
+
+      function formatTime(milliseconds) {
+        const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+        const minutes = Math.floor(totalSeconds / 60);
+        const seconds = totalSeconds % 60;
+
+        return (
+          String(minutes).padStart(2, "0") +
+          ":" +
+          String(seconds).padStart(2, "0")
+        );
+      }
+
+      function updateTimer(session) {
+        if (!session || state.currentSession !== session) return;
+
+        elements.timer.textContent = formatTime(
+          Date.now() - session.startedAt
+        );
+      }
+
+      function createFilename(date, mimeType) {
+        // Use local time and a filename-safe timestamp.
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, "0");
+        const day = String(date.getDate()).padStart(2, "0");
+        const hours = String(date.getHours()).padStart(2, "0");
+        const minutes = String(date.getMinutes()).padStart(2, "0");
+        const seconds = String(date.getSeconds()).padStart(2, "0");
+
+        const timestamp =
+          `${year}-${month}-${day}T${hours}-${minutes}-${seconds}`;
+
+        const type = (mimeType || "").toLowerCase();
+        let extension = "webm";
+
+        if (type.includes("mp4")) {
+          extension = "mp4";
+        } else if (type.includes("ogg")) {
+          extension = "ogg";
+        } else if (type.includes("wav")) {
+          extension = "wav";
+        } else if (type.includes("aac")) {
+          extension = "aac";
+        }
+
+        return `VoiceRec_${timestamp}.${extension}`;
+      }
+
+      // Prepare the canvas at the device's pixel ratio for a crisp display.
+      function prepareCanvas() {
+        const canvas = elements.visualizer;
+        const context = canvas.getContext("2d");
+
+        if (!context) return null;
+
+        const rect = canvas.getBoundingClientRect();
+        const width = Math.max(1, rect.width);
+        const height = Math.max(1, rect.height);
+        const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+
+        const targetWidth = Math.round(width * pixelRatio);
+        const targetHeight = Math.round(height * pixelRatio);
+
+        if (
+          canvas.width !== targetWidth ||
+          canvas.height !== targetHeight
+        ) {
+          canvas.width = targetWidth;
+          canvas.height = targetHeight;
+        }
+
+        context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+
+        return { context, width, height };
+      }
+
+      function drawIdleVisualizer() {
+        const canvasData = prepareCanvas();
+        if (!canvasData) return;
+
+        const { context, width, height } = canvasData;
+
+        context.clearRect(0, 0, width, height);
+        context.beginPath();
+        context.moveTo(0, height / 2);
+        context.lineTo(width, height / 2);
+        context.strokeStyle = "rgba(135, 160, 202, 0.22)";
+        context.lineWidth = 2;
+        context.stroke();
+
+        // A subtle static waveform makes the empty canvas look intentional.
+        const center = height / 2;
+        const points = 66;
+
+        context.beginPath();
+
+        for (let i = 0; i <= points; i++) {
+          const x = (i / points) * width;
+          const taper = Math.sin((i / points) * Math.PI);
+          const y =
+            center +
+            Math.sin(i * 0.61) * taper * 5 +
+            Math.cos(i * 0.27) * taper * 3;
+
+          if (i === 0) {
+            context.moveTo(x, y);
+          } else {
+            context.lineTo(x, y);
+          }
+        }
+
+        context.strokeStyle = "rgba(66, 230, 189, 0.52)";
+        context.lineWidth = 1.5;
+        context.stroke();
+      }
+
+      // Draw frequency bars with the Web Audio AnalyserNode.
+      function animateVisualizer(session) {
+        if (
+          !state.isRecording ||
+          state.currentSession !== session ||
+          !session.analyser
+        ) {
+          return;
+        }
+
+        const canvasData = prepareCanvas();
+
+        if (!canvasData) return;
+
+        const { context, width, height } = canvasData;
+        const analyser = session.analyser;
+        const frequencyData = new Uint8Array(analyser.frequencyBinCount);
+
+        analyser.getByteFrequencyData(frequencyData);
+
+        context.clearRect(0, 0, width, height);
+
+        const barCount = Math.min(42, frequencyData.length);
+        const gap = Math.max(2, Math.min(4, width / 100));
+        const barWidth = Math.max(
+          1,
+          (width - gap * (barCount - 1)) / barCount
+        );
+
+        const center = height / 2;
+        const maxBarHeight = height * 0.83;
+
+        for (let i = 0; i < barCount; i++) {
+          const index = Math.floor(
+            (i / barCount) * frequencyData.length
+          );
+
+          const amplitude = frequencyData[index] / 255;
+          const barHeight = Math.max(3, amplitude * maxBarHeight);
+          const x = i * (barWidth + gap);
+          const y = center - barHeight / 2;
+          const hue = 157 + (i / barCount) * 35;
+
+          context.fillStyle = `hsl(${hue}, 86%, 64%)`;
+          context.fillRect(x, y, barWidth, barHeight);
+        }
+
+        session.animationFrame = window.requestAnimationFrame(() => {
+          animateVisualizer(session);
+        });
+      }
+
+      function setupVisualizer(session) {
+        if (!session.audioContext) {
+          elements.visualizerHint.textContent =
+            "Audio visualization is unavailable, but recording can still work.";
+          drawIdleVisualizer();
+          return;
+        }
+
+        try {
+          session.analyser = session.audioContext.createAnalyser();
+          session.analyser.fftSize = 128;
+          session.analyser.smoothingTimeConstant = 0.82;
+
+          session.source =
+            session.audioContext.createMediaStreamSource(session.stream);
+
+          // Connect only to the analyser. Do not route the microphone
+          // into the speakers, which could cause audio feedback.
+          session.source.connect(session.analyser);
+
+          if (session.audioContext.state === "suspended") {
+            const resumePromise = session.audioContext.resume();
+            if (resumePromise && typeof resumePromise.catch === "function") {
+              resumePromise.catch(() => {});
+            }
+          }
+
+          elements.visualizerHint.textContent =
+            "Live audio visualization · Sound waves move with your voice.";
+
+          animateVisualizer(session);
+        } catch (_) {
+          elements.visualizerHint.textContent =
+            "Audio visualization is unavailable, but recording can still work.";
+          drawIdleVisualizer();
+        }
+      }
+
+      function stopVisualizer(session) {
+        if (!session) return;
+
+        if (session.animationFrame) {
+          window.cancelAnimationFrame(session.animationFrame);
+          session.animationFrame = null;
+        }
+
+        if (session.source) {
+          try {
+            session.source.disconnect();
+          } catch (_) {
+            // The node may already have been disconnected.
+          }
+
+          session.source = null;
+        }
+
+        closeAudioContext(session.audioContext);
+        session.audioContext = null;
+        session.analyser = null;
+
+        drawIdleVisualizer();
+
+        elements.visualizerHint.textContent =
+          "Recording stopped. Start again to visualize more audio.";
+      }
+
+      // Trigger a local browser download without opening another save dialog.
+      function triggerDownload(recording) {
+        const link = document.createElement("a");
+
+        link.href = recording.url;
+        link.download = recording.filename;
+        link.hidden = true;
+        link.setAttribute("aria-hidden", "true");
+
+        document.body.appendChild(link);
+
+        try {
+          link.click();
+        } finally {
+          link.remove();
+        }
+      }
+
+      function renderRecordings() {
+        const recordings = state.recordings;
+
+        elements.recordingCount.textContent =
+          `${recordings.length} ${recordings.length === 1 ? "recording" : "recordings"}`;
+
+        elements.emptyState.hidden = recordings.length > 0;
+        elements.recordingsList.replaceChildren();
+
+        for (const recording of recordings) {
+          const item = document.createElement("article");
+          item.className = "recording-item";
+
+          const info = document.createElement("div");
+          info.className = "recording-info";
+
+          const filename = document.createElement("p");
+          filename.className = "recording-filename";
+          filename.textContent = recording.filename;
+
+          const size = document.createElement("p");
+          size.className = "recording-size";
+          size.textContent = `${(recording.blob.size / 1024).toFixed(1)} KB`;
+
+          info.append(filename, size);
+
+          const audio = document.createElement("audio");
+          audio.className = "audio-player";
+          audio.controls = true;
+          audio.preload = "metadata";
+          audio.src = recording.url;
+          audio.setAttribute(
+            "aria-label",
+            `Play recording ${recording.filename}`
+          );
+
+          const actions = document.createElement("div");
+          actions.className = "recording-actions";
+
+          const saveLink = document.createElement("a");
+          saveLink.className = "action-link";
+          saveLink.href = recording.url;
+          saveLink.download = recording.filename;
+          saveLink.textContent = "💾 Save";
+          saveLink.setAttribute(
+            "aria-label",
+            `Download ${recording.filename} again`
+          );
+
+          const deleteButton = document.createElement("button");
+          deleteButton.className = "delete-button";
+          deleteButton.type = "button";
+          deleteButton.textContent = "✕ Delete";
+          deleteButton.setAttribute(
+            "aria-label",
+            `Remove ${recording.filename} from this list`
+          );
+
+          deleteButton.addEventListener("click", () => {
+            deleteRecording(recording.id);
+          });
+
+          actions.append(saveLink, deleteButton);
+          item.append(info, audio, actions);
+          elements.recordingsList.appendChild(item);
+        }
+      }
+
+      // Remove an item and revoke its playback/download object URL.
+      function deleteRecording(id) {
+        const index = state.recordings.findIndex(
+          recording => recording.id === id
+        );
+
+        if (index === -1) return;
+
+        const recording = state.recordings[index];
+        state.recordings.splice(index, 1);
+
+        URL.revokeObjectURL(recording.url);
+
+        renderRecordings();
+        setStatus("🗑️ Recording removed from the list.", "ready");
+      }
+
+      function stopTimer(session) {
+        if (session && session.timerId) {
+          window.clearInterval(session.timerId);
+          session.timerId = null;
+        }
+
+        updateTimer(session);
+      }
+
+      function stopRecording(fromError = false) {
+        const session = state.currentSession;
+
+        if (!session || !state.isRecording) return;
+
+        state.isRecording = false;
+        state.isFinalizing = true;
+
+        stopTimer(session);
+        stopVisualizer(session);
+        renderButton();
+
+        if (fromError || session.failed) {
+          setStatus(
+            "⚠️ Recording interrupted. Trying to save captured audio…",
+            "error"
+          );
+        } else {
+          setStatus("💾 Finalizing your recording…", "info");
+        }
+
+        // Stop the recorder before stopping the source tracks so that the
+        // browser can emit the final dataavailable event.
+        try {
+          if (session.recorder.state !== "inactive") {
+            session.recorder.stop();
+          }
+        } catch (_) {
+          session.failed = true;
+          stopStreamTracks(session.stream);
+          finishRecording(session);
+          return;
+        }
+
+        stopStreamTracks(session.stream);
+      }
+
+      // Called after MediaRecorder emits its final stop event.
+      function finishRecording(session) {
+        if (session.finalized) return;
+        session.finalized = true;
+
+        if (session.timerId) {
+          window.clearInterval(session.timerId);
+          session.timerId = null;
+        }
+
+        stopStreamTracks(session.stream);
+        stopVisualizer(session);
+
+        const chunkType = session.chunks.find(chunk => chunk.type)?.type;
+        const mimeType =
+          session.recorder.mimeType || chunkType || "audio/webm";
+
+        const blob = new Blob(session.chunks, { type: mimeType });
+
+        state.isRecording = false;
+        state.isStarting = false;
+        state.isFinalizing = false;
+
+        if (state.currentSession === session) {
+          state.currentSession = null;
+        }
+
+        renderButton();
+
+        if (blob.size === 0) {
+          elements.visualizerHint.textContent =
+            "Start a new recording whenever you are ready.";
+
+          setStatus(
+            "⚠️ No audio data was captured. Please try recording again.",
+            "error"
+          );
+          return;
+        }
+
+        const filename = createFilename(new Date(), mimeType);
+        const url = URL.createObjectURL(blob);
+
+        const recording = {
+          id: state.nextRecordingId++,
+          filename,
+          blob,
+          url,
+          mimeType
+        };
+
+        state.recordings.unshift(recording);
+        renderRecordings();
+
+        try {
+          triggerDownload(recording);
+
+          if (session.failed) {
+            setStatus(
+              "⚠️ A partial recording was downloaded. Check your recording below.",
+              "error"
+            );
+          } else {
+            setStatus("✅ Saved to your device", "ready");
+          }
+        } catch (_) {
+          setStatus(
+            "⚠️ Your recording is ready below. Use Save to download it.",
+            "error"
+          );
+        }
+
+        elements.visualizerHint.textContent =
+          "Start another recording whenever you are ready.";
+      }
+
+      async function startRecording() {
+        if (
+          state.isStarting ||
+          state.isRecording ||
+          state.isFinalizing
+        ) {
+          return;
+        }
+
+        if (
+          !navigator.mediaDevices ||
+          typeof navigator.mediaDevices.getUserMedia !== "function"
+        ) {
+          setStatus(
+            "🔒 Microphone access needs HTTPS or localhost in a supported browser.",
+            "error"
+          );
+          return;
+        }
+
+        if (typeof window.MediaRecorder !== "function") {
+          setStatus(
+            "⚠️ Your browser does not support audio recording. Try an updated version of Chrome or Safari.",
+            "error"
+          );
+          return;
+        }
+
+        if (
+          window.isSecureContext === false &&
+          location.hostname !== "localhost" &&
+          location.hostname !== "127.0.0.1"
+        ) {
+          setStatus(
+            "🔒 Please open this app through HTTPS or localhost to enable the microphone.",
+            "error"
+          );
+          return;
+        }
+
+        state.isStarting = true;
+        renderButton();
+        setStatus("🎙️ Requesting microphone access…", "info");
+
+        let stream = null;
+        let audioContext = createAudioContext();
+
+        try {
+          // Apply browser-supported voice clarity enhancements.
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          });
+
+          const recorder = createMediaRecorder(stream);
+
+          const session = {
+            recorder,
+            stream,
+            chunks: [],
+            startedAt: Date.now(),
+            timerId: null,
+            animationFrame: null,
+            audioContext,
+            analyser: null,
+            source: null,
+            failed: false,
+            finalized: false
+          };
+
+          state.currentSession = session;
+
+          recorder.addEventListener("dataavailable", event => {
+            if (event.data && event.data.size > 0) {
+              session.chunks.push(event.data);
+            }
+          });
+
+          recorder.addEventListener("error", () => {
+            session.failed = true;
+
+            if (
+              state.currentSession === session &&
+              state.isRecording
+            ) {
+              stopRecording(true);
+            } else {
+              setStatus(
+                "⚠️ A recording error occurred. Trying to recover your audio.",
+                "error"
+              );
+            }
+          });
+
+          recorder.addEventListener(
+            "stop",
+            () => finishRecording(session),
+            { once: true }
+          );
+
+          // A timeslice periodically provides data during longer recordings.
+          recorder.start(250);
+
+          state.isRecording = true;
+          elements.timer.textContent = "00:00";
+
+          setStatus("🔴 Recording...", "recording");
+          elements.visualizerHint.textContent =
+            "Live audio visualization · Sound waves move with your voice.";
+
+          session.timerId = window.setInterval(() => {
+            updateTimer(session);
+          }, 200);
+
+          setupVisualizer(session);
+        } catch (error) {
+          stopStreamTracks(stream);
+          closeAudioContext(audioContext);
+
+          state.currentSession = null;
+          state.isRecording = false;
+
+          elements.visualizerHint.textContent =
+            "Your sound waves will appear here while you record.";
+
+          setStatus(getFriendlyError(error), "error");
+          drawIdleVisualizer();
+        } finally {
+          state.isStarting = false;
+          renderButton();
+        }
+      }
+
+      elements.button.addEventListener("click", () => {
+        if (state.isRecording) {
+          stopRecording();
+        } else {
+          startRecording();
+        }
+      });
+
+      window.addEventListener("resize", () => {
+        const session = state.currentSession;
+
+        if (
+          session &&
+          state.isRecording &&
+          session.analyser
+        ) {
+          // The next animation frame redraws using the new canvas dimensions.
+          return;
+        }
+
+        drawIdleVisualizer();
+      });
+
+      // Draw an attractive idle waveform on the initial page load.
+      renderButton();
+      renderRecordings();
+      drawIdleVisualizer();
+    })();
+  </script>
+</body>
+</html>
